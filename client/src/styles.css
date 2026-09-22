@@ -641,6 +641,108 @@ body {
 .marker-phase-paused { color: var(--amber); border-color: rgba(255, 176, 32, .45); }
 .marker-phase-finished { color: var(--red); border-color: rgba(255, 68, 68, .5); }
 
+/* ---------------- 控制台交接（handover） ---------------- */
+.hint-handover { color: var(--accent); }
+
+.handover-panel { padding-bottom: 18px; }
+.handover-card {
+  margin-top: 10px;
+  padding: 16px 18px;
+  border-radius: 10px;
+  border: 1px solid #33405f;
+  background: var(--panel-2);
+}
+.handover-waiting {
+  border-color: rgba(79, 140, 255, .6);
+  box-shadow: 0 0 18px rgba(79, 140, 255, .12);
+}
+.handover-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.handover-title { font-size: 15px; font-weight: 700; }
+.handover-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(79, 140, 255, .7);
+  animation: pulse-amber 1.2s ease-in-out infinite;
+}
+.handover-countdown {
+  margin-left: auto;
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  letter-spacing: 1px;
+}
+.handover-code {
+  margin: 12px 0 6px;
+  text-align: center;
+  font-size: 46px;
+  font-weight: 800;
+  letter-spacing: 14px;
+  text-indent: 14px;
+  font-variant-numeric: tabular-nums;
+  color: #9db9ff;
+  text-shadow: 0 0 30px rgba(79, 140, 255, .35);
+  user-select: all;
+}
+.handover-intro b { color: #cdd9f2; }
+.handover-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+
+.handover-receiver { margin: 6px 0 16px; }
+.handover-receiver-title { margin: 0 0 12px; font-size: 15px; color: #cdd9f2; }
+.handover-receive-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.handover-code-input {
+  width: 200px;
+  padding: 12px 14px;
+  font-size: 28px;
+  letter-spacing: 10px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  border-radius: 10px;
+  border: 1px solid rgba(79, 140, 255, .55);
+  background: var(--panel-2);
+  color: var(--text);
+}
+.handover-code-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 14px rgba(79, 140, 255, .25); }
+.handover-receive-row .handover-countdown { margin-left: 4px; }
+.handover-error { margin-top: 10px; }
+
+.handover-result {
+  margin: 10px 0 4px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  animation: cue-in .25s ease-out;
+}
+.handover-result-success {
+  color: var(--green);
+  border: 1px solid rgba(46, 204, 113, .55);
+  background: rgba(46, 204, 113, .1);
+}
+.handover-result-expired {
+  color: var(--amber);
+  border: 1px solid rgba(255, 176, 32, .55);
+  background: rgba(255, 176, 32, .1);
+}
+.handover-result-cancelled {
+  color: var(--muted);
+  border: 1px solid #3a4665;
+  background: rgba(139, 151, 173, .08);
+}
+
 /* ---------------- 设备巡检门禁（控制台） ---------------- */
 .insp-gate {
   display: flex;

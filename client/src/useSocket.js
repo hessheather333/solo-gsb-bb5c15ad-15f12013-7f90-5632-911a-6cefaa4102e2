@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { monoNow } from './time.js';
-import { judgeSnapshot, judgeCue, INITIAL_BASELINE, INITIAL_CUE_BASELINE } from './guard.js';
+import {
+  judgeSnapshot,
+  judgeCue,
+  judgeHandover,
+  INITIAL_BASELINE,
+  INITIAL_CUE_BASELINE,
+  INITIAL_HANDOVER_BASELINE,
+} from './guard.js';
 
 // 单一 WebSocket 连接管理：
 //  - 自动重连（指数退避，上限 5s）；
@@ -23,14 +30,18 @@ export function useSocket({ role, screenRef }) {
   const [screenConflict, setScreenConflict] = useState(false); // 投屏：同一 ID 被新连接顶替
   const [connState, setConnState] = useState('connecting'); // connecting | open | reconnecting
   const [control, setControl] = useState({ granted: false });
+  const [myId, setMyId] = useState(null);              // 本连接服务端分配的 clientId
+  const [handover, setHandover] = useState(null);      // 控制台交接：{ state, ... } 等待/成功/过期/取消
   const [lastError, setLastError] = useState(null);
   const wsRef = useRef(null);
   const retryRef = useRef(0);
   const reconnectTimerRef = useRef(null);
   const wantControlRef = useRef(role === 'console'); // 控制台始终希望持有控制权
+  const heldRef = useRef(false); // 本连接当前是否持有租约（仅持有期间续租，避免非持有者心跳刷错误）
   const myIdRef = useRef(null);
   const baselineRef = useRef({ ...INITIAL_BASELINE });
   const cueBaselineRef = useRef({ ...INITIAL_CUE_BASELINE });
+  const handoverBaselineRef = useRef({ ...INITIAL_HANDOVER_BASELINE });
   const reportedCueRef = useRef(0); // 已上报“已显示”的 cueSeq（同一条补发不重复上报）
   const screenRefRef = useRef(screenRef);
   screenRefRef.current = screenRef;
@@ -50,6 +61,21 @@ export function useSocket({ role, screenRef }) {
     send({ command: 'release' });
     setControl({ granted: false });
   }, [send]);
+
+  // 控制台交接：持有者生成/取消一次性交接码；接收方核销；clearHandover 仅清本地终态横幅
+  const createHandover = useCallback(() => {
+    send({ command: 'handover_create' });
+  }, [send]);
+
+  const cancelHandover = useCallback(() => {
+    send({ command: 'handover_cancel' });
+  }, [send]);
+
+  const redeemHandover = useCallback((code) => {
+    send({ command: 'handover_redeem', code: String(code ?? '').trim() });
+  }, [send]);
+
+  const clearHandover = useCallback(() => setHandover(null), []);
 
   const clearError = useCallback(() => setLastError(null), []);
 
@@ -96,7 +122,11 @@ export function useSocket({ role, screenRef }) {
         if (role === 'console') {
           if (wantControlRef.current) ws.send(JSON.stringify({ command: 'acquire' }));
           heartbeatTimer = setInterval(() => {
-            ws.send(JSON.stringify({ command: 'heartbeat' }));
+            // 仅在确实持有时续租：交接转出 / 被拒 / 释放后停止心跳，
+            // 既避免旧持有者迟到心跳干扰，也不向界面刷 NOT_CONTROLLER 错误。
+            if (heldRef.current && ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ command: 'heartbeat' }));
+            }
           }, HEARTBEAT_MS);
         }
       });
@@ -111,9 +141,11 @@ export function useSocket({ role, screenRef }) {
 
         if (msg.type === 'hello') {
           myIdRef.current = msg.clientId;
+          setMyId(msg.clientId);
           // 连接/重连首包显式建立纪元基线；服务端重启后 epoch 变化，重置版本号
           baselineRef.current = { currentEpoch: msg.epoch, currentVersion: 0 };
           cueBaselineRef.current = { currentEpoch: msg.epoch, cueSeq: 0 };
+          handoverBaselineRef.current = { currentEpoch: msg.epoch, seq: 0 };
           reportedCueRef.current = 0;
           // 新纪元：丢弃上一纪元残留的门禁横幅（权威状态随 inspection 首包重建）
           setGateEvent(null);
@@ -129,6 +161,7 @@ export function useSocket({ role, screenRef }) {
 
           // 控制权归属对账（可能被其他控制台顶掉/超时释放）
           const mine = msg.holderId != null && msg.holderId === myIdRef.current;
+          heldRef.current = mine;
           setControl((prev) => {
             if (prev.granted === mine && prev.holderId === msg.holderId) return prev;
             return mine
@@ -184,6 +217,46 @@ export function useSocket({ role, screenRef }) {
           return;
         }
 
+        if (msg.type === 'handover' && role === 'console') {
+          // 交接事件守卫：旧纪元/更旧 seq 丢弃；同 seq 的 pending 为带码补发（幂等补 code）
+          const verdict = judgeHandover(handoverBaselineRef.current, msg);
+          if (!verdict.accept) return;
+          handoverBaselineRef.current = { currentEpoch: verdict.epoch, seq: verdict.seq };
+          if (msg.state === 'pending') {
+            setHandover((prev) => {
+              // 同 seq 补发：仅在补发带来 code（生成者单播）时合并，其余字段不回退
+              if (!verdict.fresh && prev && prev.state === 'pending' && prev.seq === msg.seq) {
+                return { ...prev, code: prev.code ?? msg.code ?? null, receivedAtMono: monoNow() };
+              }
+              const { code, holderId, createdAtMono, expiresAtMono, ttlMs } = msg;
+              return {
+                state: 'pending',
+                seq: msg.seq,
+                code: code ?? null,
+                holderId: holderId ?? null,
+                createdAtMono: createdAtMono ?? null,
+                expiresAtMono: expiresAtMono ?? null,
+                ttlMs: ttlMs ?? null,
+                serverTimeMono: msg.serverTimeMono ?? null,
+                receivedAtMono: monoNow(),
+              };
+            });
+          } else if (msg.state === 'idle') {
+            setHandover(null);
+          } else {
+            // success | expired | cancelled：双方实时显示结果（由面板定时收起）
+            setHandover({
+              state: msg.state,
+              seq: msg.seq,
+              reason: msg.reason ?? null,
+              holderId: msg.holderId ?? null,
+              newHolderId: msg.newHolderId ?? null,
+              atMono: monoNow(),
+            });
+          }
+          return;
+        }
+
         if (msg.type === 'cue' && role === 'display') {
           // 提示守卫：旧纪元 / 更小 cueSeq 的迟到消息一律丢弃；
           // cueSeq 相等为重连同一条补发（幂等），更大为新提示（覆盖）。
@@ -222,14 +295,17 @@ export function useSocket({ role, screenRef }) {
           // 控制权消息为单播；targetId 存在时仅当事连接处理
           if (msg.targetId && msg.targetId !== myIdRef.current) return;
           if (msg.granted) {
+            heldRef.current = true;
             setControl({ granted: true, holderId: myIdRef.current });
           } else {
-            // 被拒绝 / 释放 / 断线 / 超时，本端失去控制权
+            heldRef.current = false;
+            // 被拒绝 / 释放 / 断线 / 超时 / 交接转出，本端失去控制权
             setControl({
               granted: false,
               reason: msg.reason,
               holderId: msg.holderId ?? null,
-              locked: msg.reason === 'locked',
+              // 交接转出后锁仍被新持有者占用；locked/holderId 以下一帧权威快照对账为准
+              locked: msg.reason === 'locked' || msg.reason === 'handover',
             });
           }
           return;
@@ -243,6 +319,7 @@ export function useSocket({ role, screenRef }) {
 
       ws.addEventListener('close', () => {
         clearInterval(heartbeatTimer);
+        heldRef.current = false;
         if (disposed) return;
         setConnState('reconnecting');
         setControl((prev) => (prev.granted ? { ...prev, granted: false, reason: 'reconnect' } : prev));
@@ -284,6 +361,8 @@ export function useSocket({ role, screenRef }) {
     screenConflict,
     connState,
     control,
+    myId,
+    handover,
     lastError,
     send,
     acquire,
@@ -291,5 +370,9 @@ export function useSocket({ role, screenRef }) {
     renameScreen,
     ackCue,
     clearError,
+    createHandover,
+    cancelHandover,
+    redeemHandover,
+    clearHandover,
   };
 }

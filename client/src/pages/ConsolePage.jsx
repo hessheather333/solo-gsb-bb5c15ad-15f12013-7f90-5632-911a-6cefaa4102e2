@@ -5,12 +5,14 @@ import AgendaPanel from './AgendaPanel.jsx';
 import CuePanel from './CuePanel.jsx';
 import MarkerPanel from './MarkerPanel.jsx';
 import InspectionPanel from './InspectionPanel.jsx';
+import HandoverPanel from './HandoverPanel.jsx';
 
 // 控制台：同一时刻全服务仅一个实例可持有控制权。
 export default function ConsolePage() {
   const {
-    snap, screens, markers, inspection, gateEvent, connState, control, lastError,
+    snap, screens, markers, inspection, gateEvent, connState, control, myId, handover, lastError,
     send, acquire, release, clearError,
+    createHandover, cancelHandover, redeemHandover, clearHandover,
   } = useSocket({ role: 'console' });
   const [minutes, setMinutes] = useState(5);
   const [seconds, setSeconds] = useState(0);
@@ -74,9 +76,23 @@ export default function ConsolePage() {
         <section className="lock-panel">
           {control.locked ? (
             <>
-              <p>已有其他控制台持有控制权，需等待其释放或失联（约 15 秒无心跳）后自动释放。</p>
+              <p>已有其他控制台持有控制权，需等待其释放或失联（约 15 秒无心跳）后自动释放；
+                也可请持有者生成<b>交接码</b>，输入后立即无缝接管。</p>
+              {handover && (
+                <HandoverPanel
+                  variant="receiver"
+                  myId={myId}
+                  handover={handover}
+                  onRedeem={redeemHandover}
+                  onClearResult={clearHandover}
+                  lastError={lastError}
+                />
+              )}
               <button className="btn" onClick={acquire}>重新申请控制权</button>
               {control.reason === 'reconnect' && <p className="hint">网络重连后将自动重新申请。</p>}
+              {control.reason === 'handover' && (
+                <p className="hint hint-handover">控制权已通过交接码转移给另一台控制台；交接码立即失效。</p>
+              )}
             </>
           ) : (
             <>
@@ -246,9 +262,21 @@ export default function ConsolePage() {
       />
 
       {control.granted && (
-        <div className="release-row">
-          <button className="btn btn-ghost" onClick={release}>释放控制权（供其他控制台接管）</button>
-        </div>
+        <>
+          <HandoverPanel
+            variant="holder"
+            myId={myId}
+            handover={handover}
+            canCreate={control.granted}
+            onCreate={createHandover}
+            onCancel={cancelHandover}
+            onClearResult={clearHandover}
+            lastError={lastError}
+          />
+          <div className="release-row">
+            <button className="btn btn-ghost" onClick={release}>释放控制权（供其他控制台接管）</button>
+          </div>
+        </>
       )}
 
       <p className="foot-tip">投屏地址：<a href="/display" target="_blank" rel="noreferrer">/display</a>（可多屏打开）</p>

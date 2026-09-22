@@ -1,6 +1,13 @@
 // 版本守卫纯函数单测：node test/guard.test.mjs
 import assert from 'node:assert/strict';
-import { judgeSnapshot, judgeCue, INITIAL_BASELINE, INITIAL_CUE_BASELINE } from '../client/src/guard.js';
+import {
+  judgeSnapshot,
+  judgeCue,
+  judgeHandover,
+  INITIAL_BASELINE,
+  INITIAL_CUE_BASELINE,
+  INITIAL_HANDOVER_BASELINE,
+} from '../client/src/guard.js';
 
 let n = 0;
 const check = (name, fn) => { fn(); n += 1; console.log(`  ✓ ${name}`); };
@@ -76,6 +83,50 @@ check('cue：新纪元（服务端重启）首条在 hello 重置基线后接受
 
 check('cue：INITIAL_CUE_BASELINE 下首条兜底接受', () => {
   const v = judgeCue(INITIAL_CUE_BASELINE, { epoch: 'E9', cueSeq: 5 });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+});
+
+// ---------------- 控制台交接（handover） ----------------
+let hoBase = { currentEpoch: 'E1', seq: 0 };
+
+check('handover：INITIAL 基线首条兜底接受（pending 等待态）', () => {
+  const v = judgeHandover(INITIAL_HANDOVER_BASELINE, { epoch: 'E1', seq: 1, state: 'pending' });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+  hoBase = { currentEpoch: v.epoch, seq: v.seq };
+});
+
+check('handover：同 seq 的 pending（带码单播补发）接受但非 fresh，用于幂等补 code', () => {
+  const v = judgeHandover(hoBase, { epoch: 'E1', seq: 1, state: 'pending', code: '123456' });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, false);
+});
+
+check('handover：更大 seq 的 success 终态接受（fresh）', () => {
+  const v = judgeHandover(hoBase, { epoch: 'E1', seq: 2, state: 'success' });
+  assert.equal(v.accept, true);
+  assert.equal(v.fresh, true);
+  hoBase = { currentEpoch: v.epoch, seq: v.seq };
+});
+
+check('handover：相同 seq 的终态重复消息丢弃（结果横幅不重复刷新）', () => {
+  const v = judgeHandover(hoBase, { epoch: 'E1', seq: 2, state: 'success' });
+  assert.equal(v.accept, false);
+});
+
+check('handover：更旧 seq 的迟到 pending 丢弃（旧码不得覆盖已成功/过期的结果）', () => {
+  const v = judgeHandover(hoBase, { epoch: 'E1', seq: 1, state: 'pending', code: '000000' });
+  assert.equal(v.accept, false);
+});
+
+check('handover：旧纪元残留交接事件丢弃', () => {
+  const v = judgeHandover(hoBase, { epoch: 'E0', seq: 99, state: 'pending' });
+  assert.equal(v.accept, false);
+});
+
+check('handover：重新生成（pending→更大 seq pending）作为新事件接受', () => {
+  const v = judgeHandover({ currentEpoch: 'E1', seq: 3 }, { epoch: 'E1', seq: 4, state: 'pending' });
   assert.equal(v.accept, true);
   assert.equal(v.fresh, true);
 });
