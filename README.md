@@ -8,6 +8,8 @@
 未送达 / 已显示 / 已确认。控制台还提供**现场标记**：持有控制权时在当前环节记录带名称的
 事件（发言切换、设备故障等），服务端以单调时钟固化发生时刻、归属环节与相对计划偏差，
 按时间线展示、可删除最近一条并按本场会话导出 CSV（投屏不显示任何标记）。
+换班时持有者可生成 **60 秒一次性交接码**，另一台控制台凭码**无缝接管**唯一控制权：
+计时、议程、巡检与提示状态保持连续，投屏不中断。
 
 - **后端**：Node.js 原生 HTTP + [`ws`](https://github.com/websockets/ws) WebSocket
 - **前端**：React 18 + Vite（控制台 `/console`、投屏 `/display`）
@@ -26,7 +28,7 @@ docker compose up --build
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
 | 首页 | <http://localhost:3000/> | 入口导航 |
-| 控制台 | <http://localhost:3000/console> | 维护议程、设定当前环节、开始/暂停/继续/结束本环节（同一时刻仅一个可操作） |
+| 控制台 | <http://localhost:3000/console> | 维护议程、设定当前环节、开始/暂停/继续/结束本环节（同一时刻仅一个可操作）；持有者可生成交接码无缝移交控制权 |
 | 投屏页 | <http://localhost:3000/display> | 大屏展示当前环节、下一环节及其预计开始时间，可在任意多块屏幕同时打开 |
 
 ### Docker / Compose 启动说明
@@ -120,6 +122,25 @@ docker run --rm -p 3000:3000 --name venue-countdown venue-countdown
    “结束本环节 / 进入下一环节”的自动连续计时不受门禁限制，巡检中途出故障不会掐断正在进行的发言。
 7. 巡检数据仅存服务端内存（服务 / 容器重启即清空），仅持有者可维护与登记；**投屏不显示任何巡检信息**。
 
+### 控制台交接（handover）
+
+换班 / 换设备时，无需等待失联释放，可把唯一控制权**无缝交接**给另一台控制台：
+
+1. **持有者**在控制台 `/console` 的 **控制台交接** 面板点 **生成交接码**：服务端生成
+   **6 位数字、60 秒有效的一次性交接码**并只显示给持有者；生成后持有者**仍可正常操作**
+   （计时 / 议程 / 巡检 / 提示不受影响）。重新生成会使旧码立即失效。
+2. **接收方**在另一台电脑 / 平板打开 `http://<服务器地址>:3000/console`
+   （本机即 <http://localhost:3000/console>），在锁定面板的 **交接码** 输入框键入该码并提交。
+3. 服务端校验通过后**原子转移控制权**：旧持有者立即变为旁观（不再自动重新申请），
+   接收方立即成为新持有者并接管全部操作；**计时、议程、巡检门禁与后台提示状态保持连续，
+   投屏画面不中断**（投屏只收到一次持有者变化的普通快照）。
+4. 双方实时看到结果：持有者侧显示“等待接收（倒计时）→ 已交接 / 已过期”，
+   接收方侧显示“等待输入 → 接管成功 / 错误原因”。
+5. 码在**交接成功或 60 秒超时后立即失效**：重复提交、错误码、非持有者生成、
+   持有者本人提交、投屏连接提交均被服务端拒绝；持有者释放 / 失联后未使用的码一并作废。
+   旧持有者迟到的心跳或指令因租约已换绑而被统一拒绝（`NOT_CONTROLLER`），
+   **不会夺回控制权或改写任何状态**。连续输错 5 次的连接会被冷却 10 秒，限制在线猜码。
+
 投屏页建议按 **F11** 全屏。另起一台电脑/平板做控制台时，把 `localhost` 换成本机局域网 IP 即可。
 
 ## 本地开发（不用 Docker）
@@ -181,6 +202,14 @@ npm install && npm run build && npm start
     重新逐项登记、全部必检复检通过后才再次放行；
   - 非必检项不参与门禁；无必检项时门禁不启用；暂停后的“继续”与“进入下一环节”不受门禁限制；
   - 巡检消息按连接角色过滤，**投屏永不显示**；仅存服务端内存，服务 / 容器重启即清空。
+- **控制台交接**：
+  - 持有者可生成 **60 秒有效的一次性 6 位交接码**，生成后自己仍可正常操作；
+  - 接收方在另一台控制台输入正确码后，服务端**原子转移**唯一控制权租约，
+    计时 / 议程 / 巡检 / 提示状态连续，投屏不中断；
+  - 码在交接成功或超时后立即失效；重复提交、错误码、非持有者生成一律拒绝，
+    持有者释放 / 失联会使未使用的码一并作废；
+  - 旧持有者迟到的心跳 / 指令被统一拒绝，不会夺回控制权或改写状态；
+  - 双方实时看到等待 / 成功 / 过期结果；交接消息只发给控制台类连接，投屏不接收。
 
 ## 设计要点（对应可靠性要求）
 
@@ -219,6 +248,14 @@ npm install && npm run build && npm start
    客户端按钮置灰只是体验优化，真正的开始动作由服务端再次判定（纵深防御），任何绕过界面的
    `start` 同样会被拒绝。门禁状态翻转（放行↔失效）才单独广播 `inspection_gate`（含原因），
    普通登记只下发整体替换的 `inspection` 消息；两类消息均带 epoch 守卫且不发给投屏连接。
+9. **交接即换绑租约、状态零改动**：交接码是挂在唯一租约上的短期凭据（6 位数字、60 秒、
+   一次性，单调时钟计时），只存服务端内存。接收方提交正确码时，服务端在同一条消息处理内
+   原子完成“作废旧码 → 换绑 holder → 通知双方 → 广播快照”，计时 / 议程 / 巡检 / 提示
+   状态对象完全不动，投屏只收到一次 `holderId` 变化的普通递增快照，画面不中断。
+   此后旧持有者的心跳 / 指令因 `holder.id` 已换绑而被统一拒绝（`NOT_CONTROLLER`），
+   客户端收到 `reason=handover` 后停止自动重新申请，从机制上杜绝旧持有者夺回控制权。
+   码只在生成者仍持有控制权时有效：释放 / 断线 / 心跳超时都会先作废未使用的码；
+   交接消息按角色过滤，投屏不接收。
 
 ## WebSocket 协议（`/ws`）
 
@@ -228,6 +265,8 @@ npm install && npm run build && npm start
 { "command": "acquire" }                     // 申请控制权
 { "command": "heartbeat" }                   // 租约心跳（5s）
 { "command": "release" }                     // 主动释放
+{ "command": "handover_create" }             // 生成 60 秒一次性交接码（仅持有者）
+{ "command": "handover_accept", "code": "123456" } // 接收方凭码原子接管（非持有者控制台）
 { "command": "set_duration", "durationMs": 300000 }
 { "command": "start" }
 { "command": "pause" }
@@ -282,11 +321,22 @@ npm install && npm run build && npm start
                  "projStartMs": 33285000, "projEndMs": 33885000,
                  "effDurationMs": 600000, "insufficient": false } ] } }
 { "type": "control", "granted": true, "targetId": "c-xxxx" }
-{ "type": "control", "granted": false, "reason": "locked|released|disconnected|timeout",
+{ "type": "control", "granted": false, "reason": "locked|released|disconnected|timeout|handover",
   "targetId": "c-xxxx", "holderId": "c-yyyy" }
 { "type": "heartbeat_ack" }
 { "type": "error", "code": "NOT_CONTROLLER", "message": "..." }
 // 议程相关错误码：BAD_AGENDA（时间/时长非法或条目超限）、NOT_FOUND、NO_CURRENT
+
+// 控制台交接（handover）
+{ "type": "handover_created", "code": "123456", "expiresInMs": 60000 } // 仅单播给持有者本人
+{ "type": "handover_pending", "epoch": "...", "active": true, "expiresInMs": 60000 }
+//   ^ 有无待接收交接：连接首包下发一次，生成/失效时广播（不含码；已注册投屏的连接不收）
+{ "type": "handover_result", "result": "transferred" } // 旧持有者：已交接（toId 新持有者）
+{ "type": "handover_result", "result": "success" }     // 接收方：接管成功（fromId 旧持有者）
+{ "type": "handover_result", "result": "expired" }     // 持有者：交接码 60 秒未用已过期
+// 错误码：BAD_HANDOVER（格式非法/投屏或持有者本人提交）、BAD_HANDOVER_CODE（码不正确）、
+//         HANDOVER_INACTIVE（码未生成/已使用/已过期，含重复提交）、HANDOVER_EXPIRED（提交时刚过期）、
+//         HANDOVER_THROTTLED（连续输错 5 次，冷却 10 秒）
 
 // 后台提示相关
 { "type": "screen_hello", "screen": { "id": "s-...", "name": "主席台主屏", "online": true,
@@ -334,17 +384,17 @@ npm install && npm run build && npm start
 ├── package.json             # npm workspaces 根清单
 ├── server/
 │   └── src/
-│       ├── index.js         # HTTP 静态服务 + WebSocket 状态机/租约 + 屏幕与后台提示 + 现场标记 + 巡检门禁
+│       ├── index.js         # HTTP 静态服务 + WebSocket 状态机/租约 + 屏幕与后台提示 + 现场标记 + 巡检门禁 + 控制台交接 + 控制台交接
 │       ├── agenda.js        # 议程偏差推演纯函数（顺延 / 固定点压缩 / 校验）
 │       └── inspection.js    # 巡检门禁纯函数（清单校验 / 逐项登记 / 版本化放行判定）
 └── client/
     ├── vite.config.js       # 开发代理 /ws -> localhost:3000
     └── src/
-        ├── useSocket.js     # 自动重连、版本防回滚（快照+提示）、心跳续租、屏幕注册、标记/巡检列表
+        ├── useSocket.js     # 自动重连、版本防回滚（快照+提示）、心跳续租、屏幕注册、标记/巡检列表、交接状态
         ├── time.js          # 单调时钟插值、议程时钟格式化、挂钟时间/CSV 工具
         ├── guard.js         # 快照版本守卫 + 提示 cueSeq 守卫
         ├── screen.js        # 投屏持久屏幕 ID / 显示名（localStorage）
-        └── pages/           # ConsolePage / DisplayPage / HomePage / AgendaPanel / CuePanel / MarkerPanel / InspectionPanel
+        └── pages/           # ConsolePage / DisplayPage / HomePage / AgendaPanel / CuePanel / MarkerPanel / InspectionPanel / HandoverPanel / HandoverPanel
 ```
 
 ## 测试
@@ -356,6 +406,7 @@ npm test
 # cue.test.mjs         后台提示端到端（注册/三态/覆盖/旧确认丢弃/补发/群发/校验，自带独立实例）
 # marker.test.mjs      现场标记端到端（权限/校验/归属固化/暂停冻结/重连/advance/超时偏差/投屏不收，自带独立实例）
 # inspection.test.mjs  设备巡检门禁端到端（权限/校验/放行拦截/故障立即失效广播/编辑版本重置/继续不拦截/投屏不收，自带独立实例）
+# handover.test.mjs    控制台交接端到端（权限/校验/原子转移/计时连续/一次性/迟到指令拒绝/过期/释放作废/冷却，自带独立实例）
 # e2e.mjs              WebSocket 端到端冒烟（需先启动服务端，默认端口 3000，可用 PORT 覆盖）
 # lease.test.mjs       失联自动释放与接管（自带独立测试实例）
 ```

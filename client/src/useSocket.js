@@ -21,6 +21,9 @@ export function useSocket({ role, screenRef }) {
   const [gateEvent, setGateEvent] = useState(null);    // 门禁放行/失效翻转事件（含原因），供横幅提示
   const [cue, setCue] = useState(null);                // 投屏：当前上屏的提示
   const [screenConflict, setScreenConflict] = useState(false); // 投屏：同一 ID 被新连接顶替
+  const [handoverPending, setHandoverPending] = useState(null); // 控制台：有待接收交接 { expiresInMs, receivedAtMono }
+  const [handoverCode, setHandoverCode] = useState(null);       // 持有者：自己生成的交接码 { code, expiresInMs, receivedAtMono }
+  const [handoverResult, setHandoverResult] = useState(null);   // 交接结果事件 { result, atMono }：transferred|success|expired
   const [connState, setConnState] = useState('connecting'); // connecting | open | reconnecting
   const [control, setControl] = useState({ granted: false });
   const [lastError, setLastError] = useState(null);
@@ -52,6 +55,17 @@ export function useSocket({ role, screenRef }) {
   }, [send]);
 
   const clearError = useCallback(() => setLastError(null), []);
+
+  // 持有者：生成 60 秒一次性交接码（生成后自己仍可继续操作）
+  const createHandover = useCallback(() => {
+    send({ command: 'handover_create' });
+  }, [send]);
+
+  // 接收方：凭交接码请求接管控制权（想持有控制权，重连后自动重新申请）
+  const acceptHandover = useCallback((code) => {
+    wantControlRef.current = true;
+    send({ command: 'handover_accept', code: String(code ?? '').trim() });
+  }, [send]);
 
   // 投屏修改显示名：持久化后重发注册（服务端立即改名并广播）
   const renameScreen = useCallback((name) => {
@@ -117,6 +131,10 @@ export function useSocket({ role, screenRef }) {
           reportedCueRef.current = 0;
           // 新纪元：丢弃上一纪元残留的门禁横幅（权威状态随 inspection 首包重建）
           setGateEvent(null);
+          // 新纪元：交接状态随首包 handover_pending 重建，旧结果一并清除
+          setHandoverPending(null);
+          setHandoverCode(null);
+          setHandoverResult(null);
           return;
         }
 
@@ -218,18 +236,53 @@ export function useSocket({ role, screenRef }) {
           return;
         }
 
+        if (msg.type === 'handover_pending') {
+          // 是否有待接收的控制台交接（全体控制台类连接可见；旧纪元残留丢弃）
+          if (baselineRef.current.currentEpoch !== null && msg.epoch !== baselineRef.current.currentEpoch) {
+            return;
+          }
+          setHandoverPending(msg.active
+            ? { expiresInMs: msg.expiresInMs, receivedAtMono: monoNow() }
+            : null);
+          return;
+        }
+
+        if (msg.type === 'handover_created') {
+          // 持有者本人：交接码生成成功（码只单播给持有者，不广播）
+          setHandoverCode({
+            code: String(msg.code ?? ''),
+            expiresInMs: msg.expiresInMs,
+            receivedAtMono: monoNow(),
+          });
+          return;
+        }
+
+        if (msg.type === 'handover_result') {
+          // 交接结果事件：transferred（旧持有者）| success（接收方）| expired（码过期）
+          setHandoverResult({ result: msg.result, atMono: monoNow() });
+          if (msg.result === 'transferred' || msg.result === 'expired') {
+            setHandoverCode(null); // 码已一次性失效
+          }
+          return;
+        }
+
         if (msg.type === 'control') {
           // 控制权消息为单播；targetId 存在时仅当事连接处理
           if (msg.targetId && msg.targetId !== myIdRef.current) return;
           if (msg.granted) {
             setControl({ granted: true, holderId: myIdRef.current });
           } else {
-            // 被拒绝 / 释放 / 断线 / 超时，本端失去控制权
+            // 被拒绝 / 释放 / 断线 / 超时 / 已交接，本端失去控制权
+            if (msg.reason === 'handover') {
+              // 控制权已交接给他人：本端转为旁观，重连后不再自动重新申请
+              wantControlRef.current = false;
+            }
+            setHandoverCode(null); // 失去控制权后，自己生成的交接码已被服务端作废
             setControl({
               granted: false,
               reason: msg.reason,
               holderId: msg.holderId ?? null,
-              locked: msg.reason === 'locked',
+              locked: msg.reason === 'locked' || msg.holderId != null,
             });
           }
           return;
@@ -282,12 +335,17 @@ export function useSocket({ role, screenRef }) {
     gateEvent,
     cue,
     screenConflict,
+    handoverPending,
+    handoverCode,
+    handoverResult,
     connState,
     control,
     lastError,
     send,
     acquire,
     release,
+    createHandover,
+    acceptHandover,
     renameScreen,
     ackCue,
     clearError,

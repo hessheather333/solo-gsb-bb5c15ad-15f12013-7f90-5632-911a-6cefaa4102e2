@@ -8,6 +8,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { normalizeItems, projectAgenda, genItemId } from './agenda.js';
@@ -27,6 +28,9 @@ const TICK_MS = Number(process.env.TICK_MS || 200);            // 运行中的�
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 15_000); // 控制台心跳超时时间
 const HEARTBEAT_REAPER_MS = Number(process.env.HEARTBEAT_REAPER_MS || 1_000);   // 失联检查周期
 const LOCK_RETRY_COOLDOWN_MS = 3_000; // 控制权被占用后再次申请的最小间隔
+const HANDOVER_TTL_MS = Number(process.env.HANDOVER_TTL_MS || 60_000); // 交接码有效期（默认 60 秒）
+const HANDOVER_MAX_FAILS = 5;          // 单连接连续输错交接码上限
+const HANDOVER_FAIL_COOLDOWN_MS = 10_000; // 达到上限后的冷却时间
 const WARNING_MS = 60_000;     // 进入 60 秒醒目状态的阈值
 const MIN_DURATION_MS = 1_000;
 const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
@@ -398,8 +402,137 @@ function broadcastSnapshot() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 控制台交接（handover）
+// 持有者可生成一个 60 秒有效的一次性交接码；生成后租约不变，持有者照常操作。
+// 接收方（其他控制台连接）提交正确交接码后，服务端在同一消息处理内原子完成：
+// 作废旧码 → 换绑 holder → 通知双方 → 广播快照；计时/议程/巡检/提示状态原样连续，
+// 投屏只收到一次 holderId 变化的普通快照，画面不中断。
+// 码在交接成功或超时后立即失效；重复提交、错误码、非持有者生成一律拒绝。
+// 旧持有者失去租约后，其迟到的心跳/指令因 holder.id 已换绑而被统一拒绝，
+// 不会夺回控制权或改写状态。交接消息只发给控制台类连接，投屏不接收。
+// ---------------------------------------------------------------------------
+const handover = {
+  code: null,        // 当前有效交接码（6 位数字字符串）；null 表示无待接收交接
+  holderId: null,    // 生成交接码的持有者 client id（码只在其持有期间有效）
+  expiresAtMono: 0,  // 单调时钟到期时刻
+  timer: null,       // 到期定时器
+};
+
+function clearHandoverTimer() {
+  if (handover.timer) {
+    clearTimeout(handover.timer);
+    handover.timer = null;
+  }
+}
+
+// 向控制台类连接广播“是否有待接收交接”（不含码本身；投屏不接收）
+function broadcastHandoverPending() {
+  const active = handover.code !== null;
+  const msg = {
+    type: 'handover_pending',
+    epoch,
+    active,
+    expiresInMs: active ? Math.max(0, handover.expiresAtMono - nowMono()) : 0,
+  };
+  for (const c of clients) {
+    if (!c.screenId) send(c.ws, msg);
+  }
+}
+
+// 作废当前交接码（成功/过期/持有者变更均走这里）；幂等
+function invalidateHandover() {
+  if (handover.code === null) return;
+  clearHandoverTimer();
+  handover.code = null;
+  handover.holderId = null;
+  handover.expiresAtMono = 0;
+  broadcastHandoverPending();
+}
+
+// 到期：码未在有效期内被使用，通知生成者“已过期”
+function expireHandover() {
+  if (handover.code === null) return; // 已被成功交接或提前作废
+  const creatorId = handover.holderId;
+  invalidateHandover();
+  for (const c of clients) {
+    if (c.id === creatorId) {
+      send(c.ws, { type: 'handover_result', result: 'expired' });
+    }
+  }
+}
+
+// 持有者生成一次性交接码：重新生成会立即使旧码失效
+function createHandover(client) {
+  const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  clearHandoverTimer();
+  handover.code = code;
+  handover.holderId = client.id;
+  handover.expiresAtMono = nowMono() + HANDOVER_TTL_MS;
+  handover.timer = setTimeout(expireHandover, HANDOVER_TTL_MS);
+  handover.timer.unref?.();
+  // 码只单播给持有者本人；其他控制台仅知道“有待接收交接”
+  send(client.ws, { type: 'handover_created', code, expiresInMs: HANDOVER_TTL_MS });
+  broadcastHandoverPending();
+}
+
+// 接收方提交交接码：校验通过则原子转移控制权
+function acceptHandover(client, msg) {
+  if (client.screenId) {
+    fail(client, 'BAD_HANDOVER', '投屏连接不能接收控制台交接');
+    return;
+  }
+  if (holder && holder.id === client.id) {
+    fail(client, 'BAD_HANDOVER', '已持有控制权，无需交接码');
+    return;
+  }
+  // 连续输错冷却：限制在线暴力尝试
+  if (client.handoverFailUntilMono && nowMono() < client.handoverFailUntilMono) {
+    fail(client, 'HANDOVER_THROTTLED', '交接码错误次数过多，请稍后再试');
+    return;
+  }
+  const code = String(msg.code ?? '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    fail(client, 'BAD_HANDOVER', '交接码需为 6 位数字');
+    return;
+  }
+  // 码只在生成者仍持有控制权时有效；持有者释放/失联后码已作废
+  if (handover.code === null || !holder || handover.holderId !== holder.id) {
+    fail(client, 'HANDOVER_INACTIVE', '交接码已失效（未生成、已使用或已过期）');
+    return;
+  }
+  if (nowMono() >= handover.expiresAtMono) {
+    expireHandover(); // 惰性发现过期：立即清理并通知生成者
+    fail(client, 'HANDOVER_EXPIRED', '交接码已过期，请向持有者索取新码');
+    return;
+  }
+  if (code !== handover.code) {
+    client.handoverFails = (client.handoverFails ?? 0) + 1;
+    if (client.handoverFails >= HANDOVER_MAX_FAILS) {
+      client.handoverFails = 0;
+      client.handoverFailUntilMono = nowMono() + HANDOVER_FAIL_COOLDOWN_MS;
+    }
+    fail(client, 'BAD_HANDOVER_CODE', '交接码不正确');
+    return;
+  }
+
+  // —— 原子转移：同一消息处理内完成，期间不会有其他指令插入 ——
+  const old = holder;
+  client.handoverFails = 0; // 交接成功：清除连续输错计数
+  invalidateHandover(); // 一次性：码立即失效，重复提交必被拒
+  holder = { id: client.id, ws: client.ws, lastHeartbeatMono: nowMono() };
+  // 旧持有者：失去控制权（reason=handover，客户端据此停止自动重申请）
+  send(old.ws, { type: 'control', granted: false, reason: 'handover', targetId: old.id, holderId: client.id });
+  send(old.ws, { type: 'handover_result', result: 'transferred', toId: client.id });
+  // 新持有者：租约自转移时刻起算，由双方各自的心跳续租
+  send(client.ws, { type: 'control', granted: true, clientId: client.id, targetId: client.id });
+  send(client.ws, { type: 'handover_result', result: 'success', fromId: old.id });
+  broadcastSnapshot(); // holderId 变化立即同步；计时/议程/巡检/提示状态原样连续
+}
+
 function releaseHolder(reason) {
   if (!holder) return;
+  invalidateHandover(); // 控制权一旦离手，未完成的交接码一并作废
   const h = holder;
   holder = null;
   send(h.ws, { type: 'control', granted: false, reason, targetId: h.id });
@@ -621,6 +754,7 @@ function handleCommand(client, msg) {
   const PUBLIC_COMMANDS = new Set([
     'acquire', 'heartbeat', 'release',
     'screen_register', 'screen_rename', 'cue_displayed', 'cue_ack',
+    'handover_accept',
   ]);
   if (!PUBLIC_COMMANDS.has(cmd)) {
     if (!holder || holder.id !== client.id) {
@@ -674,6 +808,18 @@ function handleCommand(client, msg) {
       if (holder && holder.id === client.id) {
         releaseHolder('released');
       }
+      return;
+    }
+
+    case 'handover_create': {
+      // 生成 60 秒一次性交接码（仅持有者；非持有者已被上方统一拦截）
+      createHandover(client);
+      return;
+    }
+
+    case 'handover_accept': {
+      // 接收方凭码原子接管控制权（公开指令，内部逐条校验）
+      acceptHandover(client, msg);
       return;
     }
 
@@ -894,6 +1040,8 @@ function makeClient(ws) {
     joinedMono: nowMono(),
     lastDenyAtMono: 0,
     screenId: null, // 若本连接注册为投屏，记录其屏幕 ID（每连接最多一块屏）
+    handoverFails: 0,          // 连续输错交接码次数（达上限进入冷却）
+    handoverFailUntilMono: 0,  // 交接码尝试冷却截止（单调时钟）
   };
   ws.on('message', (data) => {
     let msg;
@@ -941,6 +1089,13 @@ wss.on('connection', (ws) => {
   send(ws, markersPayload());
   // 设备巡检门禁状态同样随首包下发（此刻尚未注册为投屏）
   send(ws, inspectionPayload());
+  // 当前是否有待接收的控制台交接（不含码；投屏注册后不再接收交接消息）
+  send(ws, {
+    type: 'handover_pending',
+    epoch,
+    active: handover.code !== null,
+    expiresInMs: handover.code !== null ? Math.max(0, handover.expiresAtMono - nowMono()) : 0,
+  });
 });
 
 setInterval(tick, TICK_MS).unref();

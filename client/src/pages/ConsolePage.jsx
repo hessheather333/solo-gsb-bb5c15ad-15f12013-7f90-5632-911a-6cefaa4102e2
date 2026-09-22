@@ -5,12 +5,14 @@ import AgendaPanel from './AgendaPanel.jsx';
 import CuePanel from './CuePanel.jsx';
 import MarkerPanel from './MarkerPanel.jsx';
 import InspectionPanel from './InspectionPanel.jsx';
+import HandoverPanel, { HandoverAccept } from './HandoverPanel.jsx';
 
 // 控制台：同一时刻全服务仅一个实例可持有控制权。
 export default function ConsolePage() {
   const {
     snap, screens, markers, inspection, gateEvent, connState, control, lastError,
-    send, acquire, release, clearError,
+    handoverPending, handoverCode, handoverResult,
+    send, acquire, release, clearError, createHandover, acceptHandover,
   } = useSocket({ role: 'console' });
   const [minutes, setMinutes] = useState(5);
   const [seconds, setSeconds] = useState(0);
@@ -74,9 +76,17 @@ export default function ConsolePage() {
         <section className="lock-panel">
           {control.locked ? (
             <>
-              <p>已有其他控制台持有控制权，需等待其释放或失联（约 15 秒无心跳）后自动释放。</p>
+              <p>已有其他控制台持有控制权，需等待其释放或失联（约 15 秒无心跳）后自动释放；也可凭交接码立即接管。</p>
               <button className="btn" onClick={acquire}>重新申请控制权</button>
               {control.reason === 'reconnect' && <p className="hint">网络重连后将自动重新申请。</p>}
+              {control.reason === 'handover' && <p className="hint">控制权已交接给新控制台，本端已转为旁观。</p>}
+              <HandoverAccept
+                handoverPending={handoverPending}
+                handoverResult={handoverResult}
+                lastError={lastError}
+                onClearError={clearError}
+                onAccept={acceptHandover}
+              />
             </>
           ) : (
             <>
@@ -125,6 +135,17 @@ export default function ConsolePage() {
             )}
           </div>
         </section>
+      )}
+
+      {control.granted && (
+        <HandoverPanel
+          handoverCode={handoverCode}
+          handoverPending={handoverPending}
+          handoverResult={handoverResult}
+          lastError={lastError}
+          onClearError={clearError}
+          onCreate={createHandover}
+        />
       )}
 
       <InspectionPanel
